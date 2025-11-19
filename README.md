@@ -12,5 +12,9 @@ Run on a fresh Ubuntu server:
 
 ```bash
 sudo ./install_stack.sh
+```
+Check services are running:
 
-Check services are running: docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+```bash
+docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
+```
