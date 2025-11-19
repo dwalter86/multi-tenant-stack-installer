@@ -8,6 +8,8 @@ set -euo pipefail
 
 # --- helpers ---
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then SUDO="sudo"; else SUDO=""; fi
+USER_ID="${SUDO_USER:-$(id -u)}"
+GROUP_ID="$(id -g "$USER_ID" 2>/dev/null || id -g)"
 aptx() { $SUDO apt-get -o Dpkg::Lock::Timeout=600 "$@"; }
 
 STACK_DIR="/opt/stack"
@@ -19,12 +21,13 @@ WEB_PUBLIC_DIR="$WEB_DIR/public"
 WEB_JS_DIR="$WEB_DIR/js"
 SCRIPTS_DIR="$STACK_DIR/scripts"
 
-mkdir -p "$DB_INIT_DIR" "$SCRIPTS_DIR" "$API_APP_DIR" "$WEB_PUBLIC_DIR" "$WEB_JS_DIR"
+$SUDO mkdir -p "$DB_INIT_DIR" "$SCRIPTS_DIR" "$API_APP_DIR" "$WEB_PUBLIC_DIR" "$WEB_JS_DIR"
+$SUDO chown -R "$USER_ID:$GROUP_ID" "$STACK_DIR"
 cd "$STACK_DIR"
 
 echo "[1/7] Installing base packages…"
 aptx update -y
-aptx install -y ca-certificates curl gnupg ufw
+aptx install -y ca-certificates curl gnupg openssl ufw
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "[2/7] Installing Docker…"
@@ -301,6 +304,9 @@ class AccountOut(BaseModel):
     id: str
     name: str
 
+class AccountCreate(BaseModel):
+    name: str
+
 class AccountUpdate(BaseModel):
     name: str
 
@@ -520,6 +526,7 @@ from schemas import (
     Token,
     MeOut,
     AccountOut,
+    AccountCreate,
     AccountUpdate,
     ItemCreate,
     ItemOut,
@@ -563,6 +570,65 @@ async def me(user_id: str = Depends(current_user)):
 @app.get("/api/me/accounts", response_model=list[AccountOut], dependencies=[Depends(ip_allowlist)])
 async def my_accounts(user_id: str = Depends(current_user)):
   return memberships_for_user(user_id)
+
+@app.post("/api/accounts", response_model=AccountOut, status_code=201, dependencies=[Depends(ip_allowlist)])
+async def create_account(body: AccountCreate, user_id: str = Depends(current_user)):
+  name = body.name.strip()
+  if not name:
+    raise HTTPException(status_code=400, detail="Name is required")
+
+  with SessionLocal() as db:
+    row = db.execute(
+      text("INSERT INTO accounts(name) VALUES (:n) RETURNING id::text, name"),
+      {"n": name}
+    ).first()
+    if not row:
+      raise HTTPException(status_code=500, detail="Failed to create account")
+
+    account_id = row[0]
+    schema_name = f"tenant_{account_id.replace('-', '')}"
+
+    db.execute(
+      text("""
+        INSERT INTO memberships(user_id, account_id, role)
+        VALUES (:u, :a, 'owner')
+        ON CONFLICT (user_id, account_id) DO NOTHING
+      """),
+      {"u": user_id, "a": account_id}
+    )
+
+    schema_sql = f"""
+      DO $$
+      DECLARE sch text := '{schema_name}';
+      BEGIN
+        EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I', sch);
+        EXECUTE format('CREATE TABLE IF NOT EXISTS %I.items (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          section_slug TEXT NOT NULL DEFAULT ''default'',
+          name TEXT NOT NULL,
+          data JSONB NOT NULL DEFAULT ''{{}}'',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )', sch);
+        EXECUTE format('ALTER TABLE %I.items ADD COLUMN IF NOT EXISTS section_slug TEXT', sch);
+        EXECUTE format('UPDATE %I.items SET section_slug = ''default'' WHERE section_slug IS NULL', sch);
+        EXECUTE format('ALTER TABLE %I.items ALTER COLUMN section_slug SET DEFAULT ''default''', sch);
+        EXECUTE format('ALTER TABLE %I.items ALTER COLUMN section_slug SET NOT NULL', sch);
+        EXECUTE format('ALTER TABLE %I.items ENABLE ROW LEVEL SECURITY', sch);
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_policies
+          WHERE schemaname = sch AND tablename = 'items' AND policyname = 'items_tenant_policy'
+        ) THEN
+          EXECUTE format(
+            'CREATE POLICY items_tenant_policy ON %I.items
+             USING ( current_setting(''app.current_account'')::uuid = ''{account_id}'' )
+             WITH CHECK ( current_setting(''app.current_account'')::uuid = ''{account_id}'' )',
+            sch);
+        END IF;
+      END $$;
+    """
+    db.execute(text(schema_sql))
+    db.commit()
+    return AccountOut(id=row[0], name=row[1])
 
 # --- Account management ---
 
@@ -787,6 +853,9 @@ th, td { padding:8px; border-bottom:1px solid var(--border); text-align:left; ve
 input, textarea, select { width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; }
 label { display:block; }
 .card { border:1px solid var(--border); border-radius:8px; padding:12px; background:#fff; }
+.stacked-list { display:flex; flex-direction:column; gap:12px; margin-top:12px; }
+.account-card { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+.account-card strong { font-size:1.05em; }
 pre { background:#f4f4f4; padding:8px; border-radius:6px; overflow:auto; }
 
 /* Account/Section header + 3-dot menu */
@@ -1013,8 +1082,24 @@ cat > "$WEB_PUBLIC_DIR/accounts.html" <<'HTML'
 </head><body>
   <header id="site-header"></header>
   <main class="container">
-    <h1>Your Accounts</h1>
-    <ul id="accounts"></ul>
+    <div class="account-header">
+      <div class="account-header-main">
+        <h1>Your Accounts</h1>
+      </div>
+      <div class="account-header-actions">
+        <button id="accountsMenuButton" class="icon-btn" aria-haspopup="true" aria-expanded="false" aria-label="Account actions">⋯</button>
+        <div id="accountsMenu" class="dropdown-menu">
+          <button type="button" data-action="add-account">Add account</button>
+        </div>
+      </div>
+    </div>
+
+    <section>
+      <div id="accountsEmptyState" class="empty-state hidden">
+        <p class="small">You do not belong to any accounts yet.</p>
+      </div>
+      <div id="accountList" class="stacked-list"></div>
+    </section>
   </main>
   <footer id="site-footer"></footer>
   <script type="module" src="/js/api.js"></script>
@@ -1265,13 +1350,83 @@ import { loadMeOrRedirect, renderShell, api } from './common.js';
 (async () => {
   const me = await loadMeOrRedirect(); if(!me) return;
   renderShell(me);
-  const ul = document.getElementById('accounts');
-  try {
-    const accounts = await api('/api/me/accounts');
-    ul.innerHTML = accounts.map(a => `<li><a href="/account.html?id=${a.id}">${a.name}</a> <code>${a.id}</code></li>`).join('') || '<li>No accounts yet</li>';
-  } catch(e){
-    ul.innerHTML = `<li>Failed: ${e.message}</li>`;
+
+  const listEl = document.getElementById('accountList');
+  const emptyStateEl = document.getElementById('accountsEmptyState');
+  const menuButton = document.getElementById('accountsMenuButton');
+  const menu = document.getElementById('accountsMenu');
+
+  function openMenu(){
+    menu.classList.add('open');
+    menuButton.setAttribute('aria-expanded', 'true');
+    const handler = (ev) => {
+      if(!menu.contains(ev.target) && ev.target !== menuButton){
+        closeMenu();
+      }
+    };
+    document.addEventListener('click', handler, { once:true });
   }
+
+  function closeMenu(){
+    menu.classList.remove('open');
+    menuButton.setAttribute('aria-expanded', 'false');
+  }
+
+  menuButton.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if(menu.classList.contains('open')) closeMenu(); else openMenu();
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if(e.key === 'Escape'){ closeMenu(); }
+  });
+
+  async function loadAccounts(){
+    try {
+      const accounts = await api('/api/me/accounts');
+      if(!accounts.length){
+        listEl.innerHTML = '';
+        emptyStateEl.classList.remove('hidden');
+        return;
+      }
+      emptyStateEl.classList.add('hidden');
+      listEl.innerHTML = accounts.map(a => `
+        <div class="card account-card">
+          <div>
+            <strong>${a.name}</strong>
+            <div class="small"><code>${a.id}</code></div>
+          </div>
+          <div>
+            <a class="btn" href="/account.html?id=${encodeURIComponent(a.id)}">Open</a>
+          </div>
+        </div>
+      `).join('');
+    } catch(e){
+      listEl.innerHTML = `<p class="small">Failed to load accounts: ${e.message}</p>`;
+      emptyStateEl.classList.add('hidden');
+    }
+  }
+
+  menu.addEventListener('click', async (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if(!btn) return;
+    const action = btn.dataset.action;
+    closeMenu();
+    if(action === 'add-account'){
+      const name = prompt('Account name');
+      if(!name) return;
+      const trimmed = name.trim();
+      if(!trimmed) return;
+      try {
+        await api('/api/accounts', { method:'POST', body: JSON.stringify({ name: trimmed }) });
+        await loadAccounts();
+      } catch(err){
+        alert(err.message || 'Failed to create account');
+      }
+    }
+  });
+
+  await loadAccounts();
 })();
 JS
 
@@ -2173,6 +2328,7 @@ API (extended):
   GET  /api/me/accounts
 
   # Accounts
+  POST   /api/accounts
   PUT    /api/accounts/{id}
   DELETE /api/accounts/{id}
 
