@@ -2124,13 +2124,14 @@ WorkingDirectory=/opt/stack
 RemainAfterExit=true
 ExecStart=/usr/bin/docker compose up -d --remove-orphans
 ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=0
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 $SUDO mv /tmp/stack.service /etc/systemd/system/stack.service
 $SUDO systemctl daemon-reload
-$SUDO systemctl enable --now stack || true
+$SUDO systemctl enable stack || true
 
 echo "[6/7] Configuring UFW…"
 $SUDO ufw default deny incoming || true
@@ -2140,9 +2141,12 @@ $SUDO ufw allow 80/tcp || true
 $SUDO ufw allow 443/tcp || true
 echo "y" | $SUDO ufw enable || true
 
-echo "[7/7] Building & starting containers…"
-docker compose build
-$SUDO systemctl restart stack || docker compose up -d --remove-orphans
+echo "[7/7] Building images (api + web)…"
+docker compose build api web
+
+echo "[7/7] Starting containers…"
+# Prefer systemd, fall back to plain docker compose if needed
+$SUDO systemctl start stack || docker compose up -d --remove-orphans
 
 cat <<DONE
 
