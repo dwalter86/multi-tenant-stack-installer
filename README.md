@@ -18,3 +18,13 @@ Check services are running:
 ```bash
 docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 ```
+
+Reload the service:
+```bash
+systemctl daemon-reload
+```
+
+Restart the service:
+```bash
+systemctl restart stack
+```
