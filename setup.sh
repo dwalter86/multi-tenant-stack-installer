@@ -29,6 +29,24 @@ echo "[1/7] Installing base packages…"
 aptx update -y
 aptx install -y ca-certificates curl gnupg openssl ufw
 
+echo "[swap] Ensuring swap is available (to avoid OOM during build)…"
+ensure_swap() {
+  if swapon --noheadings | grep -q .; then
+    return
+  fi
+  echo "No swap detected; creating /swapfile (2G)…"
+  if ! $SUDO fallocate -l 2G /swapfile 2>/dev/null; then
+    $SUDO dd if=/dev/zero of=/swapfile bs=1M count=2048 status=none
+  fi
+  $SUDO chmod 600 /swapfile
+  $SUDO mkswap /swapfile >/dev/null
+  $SUDO swapon /swapfile
+  if ! grep -q "^/swapfile" /etc/fstab; then
+    echo "/swapfile none swap sw 0 0" | $SUDO tee -a /etc/fstab >/dev/null
+  fi
+}
+ensure_swap
+
 if ! command -v docker >/dev/null 2>&1; then
   echo "[2/7] Installing Docker…"
   $SUDO install -m 0755 -d /etc/apt/keyrings
