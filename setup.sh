@@ -907,7 +907,12 @@ async def get_item(account_id: str, item_id: str, user_id: str = Depends(current
   item = rls.get_item(account_id, item_id)
   if not item:
     raise HTTPException(status_code=404, detail="Item not found")
-  return ItemOut(id=item["id"], name=item["name"], data=item["data"])
+  return ItemOut(
+    id=item["id"],
+    name=item["name"],
+    data=item["data"],
+    created_at=item["created_at"],
+  )
 
 @app.put("/api/accounts/{account_id}/items/{item_id}", response_model=ItemOut, dependencies=[Depends(ip_allowlist)])
 async def update_item(account_id: str, item_id: str, body: ItemCreate, user_id: str = Depends(current_user)):
