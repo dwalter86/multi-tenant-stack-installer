@@ -172,6 +172,8 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   email TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  user_type TEXT NOT NULL DEFAULT 'standard',
   password_hash TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -219,11 +221,15 @@ DECLARE
 BEGIN
   SELECT id INTO u_id FROM users WHERE email='${ADMIN_EMAIL}';
   IF u_id IS NULL THEN
-    INSERT INTO users(email, password_hash, is_admin)
-    VALUES ('${ADMIN_EMAIL}', crypt('${ADMIN_PASSWORD}', gen_salt('bf', 12)), TRUE)
+    INSERT INTO users(email, name, user_type, password_hash, is_admin)
+    VALUES ('${ADMIN_EMAIL}', 'Super Admin', 'super_admin', crypt('${ADMIN_PASSWORD}', gen_salt('bf', 12)), TRUE)
     RETURNING id INTO u_id;
   ELSE
-    UPDATE users SET is_admin=TRUE WHERE id=u_id;
+    UPDATE users
+    SET is_admin=TRUE,
+        user_type='super_admin',
+        name=COALESCE(NULLIF(name, ''), 'Super Admin')
+    WHERE id=u_id;
   END IF;
 
   SELECT id INTO a_id FROM accounts WHERE name='Default company';
@@ -303,6 +309,18 @@ BEGIN
 END;$$;
 SQL
 
+cat > "$DB_INIT_DIR/005_user_fields.sql" <<'SQL'
+ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT '';
+ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS user_type TEXT NOT NULL DEFAULT 'standard';
+
+UPDATE users
+SET user_type = CASE
+  WHEN is_admin THEN 'super_admin'
+  ELSE 'standard'
+END
+WHERE COALESCE(user_type, '') = '';
+SQL
+
 # --- API ---
 cat > "$API_DIR/Dockerfile" <<'DOCKER'
 FROM python:3.11-slim
@@ -331,7 +349,7 @@ PY
 
 cat > "$API_APP_DIR/schemas.py" <<'PY'
 from pydantic import BaseModel, EmailStr, Field
-from typing import Optional, List
+from typing import Optional, List, Literal
 
 class Token(BaseModel):
     access_token: str
@@ -354,6 +372,8 @@ class PreferencesUpdate(BaseModel):
 class MeOut(BaseModel):
     id: str
     email: EmailStr
+    name: str
+    user_type: str
     is_admin: bool
     preferences: Preferences = Preferences()
 
@@ -383,11 +403,16 @@ class ItemsPage(BaseModel):
 class AdminUser(BaseModel):
     id: str
     email: EmailStr
+    name: str
+    user_type: str
     is_active: bool
+    preferences: Optional[Preferences] = None
 
 class CreateAdmin(BaseModel):
     email: EmailStr
     password: str
+    name: str
+    user_type: Literal["super_admin", "admin", "standard"] = "admin"
     accounts: List[str] = Field(default_factory=list)
 
 class SectionBase(BaseModel):
@@ -470,12 +495,22 @@ async def current_user(authorization: str = Header(default="")) -> str:
   except JWTError:
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-async def require_admin(user_id: str = Depends(current_user)) -> str:
+def _get_user_type(user_id: str) -> str:
   with SessionLocal() as db:
-    row = db.execute(text("SELECT is_admin FROM users WHERE id=:u LIMIT 1"), {"u": user_id}).first()
-    if not row or not row[0]:
-      raise HTTPException(status_code=403, detail="Admin only")
-  return user_id
+    row = db.execute(text("SELECT COALESCE(user_type, CASE WHEN is_admin THEN 'admin' ELSE 'standard' END) FROM users WHERE id=:u LIMIT 1"), {"u": user_id}).first()
+    return row[0] if row else "standard"
+
+async def require_admin(user_id: str = Depends(current_user)) -> dict:
+  user_type = _get_user_type(user_id)
+  if user_type not in ("admin", "super_admin"):
+    raise HTTPException(status_code=403, detail="Admin only")
+  return {"id": user_id, "user_type": user_type}
+
+async def require_super_admin(user_id: str = Depends(current_user)) -> dict:
+  user_type = _get_user_type(user_id)
+  if user_type != "super_admin":
+    raise HTTPException(status_code=403, detail="Super admin only")
+  return {"id": user_id, "user_type": user_type}
 PY
 
 cat > "$API_APP_DIR/rls.py" <<'PY'
@@ -649,11 +684,21 @@ async def login(payload: LoginRequest):
 @app.get("/api/me", response_model=MeOut, dependencies=[Depends(ip_allowlist)])
 async def me(user_id: str = Depends(current_user)):
   with SessionLocal() as db:
-    row = db.execute(text("SELECT id::text, email, is_admin FROM users WHERE id=:u"), {"u": user_id}).first()
+    row = db.execute(text("""
+      SELECT id::text,
+             email,
+             COALESCE(name, ''),
+             COALESCE(user_type, CASE WHEN is_admin THEN 'admin' ELSE 'standard' END),
+             is_admin
+      FROM users
+      WHERE id=:u
+    """), {"u": user_id}).first()
     if not row:
       raise HTTPException(status_code=404, detail="User not found")
     prefs = get_preferences(db, user_id)
-    return MeOut(id=row[0], email=row[1], is_admin=bool(row[2]), preferences=Preferences(**prefs))
+    user_type = row[3] or ("admin" if row[4] else "standard")
+    is_admin_flag = user_type in ("admin", "super_admin") or bool(row[4])
+    return MeOut(id=row[0], email=row[1], name=row[2], user_type=user_type, is_admin=is_admin_flag, preferences=Preferences(**prefs))
 
 @app.get("/api/me/preferences", response_model=Preferences, dependencies=[Depends(ip_allowlist)])
 async def read_preferences(user_id: str = Depends(current_user)):
@@ -886,11 +931,24 @@ async def create_section_item(account_id: str, slug: str, body: ItemCreate, user
 
 # --- Admin API ---
 
-@app.get("/api/admin/users", response_model=list[AdminUser], dependencies=[Depends(ip_allowlist), Depends(require_admin)])
-async def list_admin_users():
+@app.get("/api/admin/users", response_model=list[AdminUser], dependencies=[Depends(ip_allowlist)])
+async def list_admin_users(admin_ctx = Depends(require_admin)):
   with SessionLocal() as db:
-    rows = db.execute(text("SELECT id::text, email, is_active FROM users WHERE is_admin = TRUE ORDER BY created_at DESC")).all()
-    return [{"id": r[0], "email": r[1], "is_active": r[2]} for r in rows]
+    rows = db.execute(text("""
+      SELECT id::text,
+             email,
+             COALESCE(name, ''),
+             COALESCE(user_type, CASE WHEN is_admin THEN 'admin' ELSE 'standard' END),
+             is_active
+      FROM users
+      ORDER BY created_at DESC
+    """)).all()
+    include_prefs = admin_ctx.get("user_type") == "super_admin"
+    result: list[AdminUser] = []
+    for r in rows:
+      prefs = get_preferences(db, r[0]) if include_prefs else None
+      result.append(AdminUser(id=r[0], email=r[1], name=r[2], user_type=r[3], is_active=r[4], preferences=Preferences(**prefs) if prefs else None))
+    return result
 
 @app.get("/api/admin/all-accounts", response_model=list[AccountOut], dependencies=[Depends(ip_allowlist), Depends(require_admin)])
 async def list_all_accounts():
@@ -898,15 +956,25 @@ async def list_all_accounts():
     rows = db.execute(text("SELECT id::text, name FROM accounts ORDER BY created_at DESC")).all()
     return [{"id": r[0], "name": r[1]} for r in rows]
 
-@app.post("/api/admin/users", response_model=AdminUser, status_code=201, dependencies=[Depends(ip_allowlist), Depends(require_admin)])
-async def create_admin(body: CreateAdmin):
+@app.post("/api/admin/users", response_model=AdminUser, status_code=201, dependencies=[Depends(ip_allowlist)])
+async def create_admin(body: CreateAdmin, admin_ctx = Depends(require_admin)):
+  requester_type = admin_ctx.get("user_type", "standard")
+  if body.user_type == "super_admin" and requester_type != "super_admin":
+    raise HTTPException(status_code=403, detail="Only super admins can create super admins")
+
+  is_admin_flag = body.user_type in ("admin", "super_admin")
+
   with SessionLocal() as db:
     row = db.execute(text("SELECT id FROM users WHERE email=:e"), {"e": body.email}).first()
     if row:
       raise HTTPException(status_code=409, detail="Email already exists")
     row = db.execute(
-      text("INSERT INTO users(email, password_hash, is_admin, is_active) VALUES (:e, crypt(:p, gen_salt('bf', 12)), TRUE, TRUE) RETURNING id::text, email, is_active"),
-      {"e": body.email, "p": body.password}
+      text("""
+        INSERT INTO users(email, name, user_type, password_hash, is_admin, is_active)
+        VALUES (:e, :n, :t, crypt(:p, gen_salt('bf', 12)), :is_admin, TRUE)
+        RETURNING id::text, email, name, user_type, is_active
+      """),
+      {"e": body.email, "n": body.name.strip(), "t": body.user_type, "p": body.password, "is_admin": is_admin_flag}
     ).first()
     new_id = row[0]
     if body.accounts:
@@ -915,8 +983,15 @@ async def create_admin(body: CreateAdmin):
         text("INSERT INTO memberships(user_id, account_id, role) SELECT :u, a.id, 'owner' FROM accounts a WHERE a.id = ANY(:ids::uuid[]) ON CONFLICT DO NOTHING"),
         {"u": new_id, "ids": ids}
       )
+    # Inherit creator customisation settings by default
+    try:
+      creator_prefs = get_preferences(db, admin_ctx.get("id"))
+      save_preferences(db, new_id, creator_prefs)
+    except Exception:
+      pass
     db.commit()
-    return {"id": row[0], "email": row[1], "is_active": row[2]}
+    prefs = get_preferences(db, new_id) if requester_type == "super_admin" else None
+    return AdminUser(id=row[0], email=row[1], name=row[2], user_type=row[3], is_active=row[4], preferences=Preferences(**prefs) if prefs else None)
 PY
 
 # --- Web (nginx) ---
@@ -1234,17 +1309,38 @@ HTML
 cat > "$WEB_PUBLIC_DIR/admin.html" <<'HTML'
 <!doctype html><html><head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Admins</title>
+  <title>Users</title>
   <link rel="stylesheet" href="/app.css">
 </head><body>
   <header id="site-header"></header>
   <main class="container">
-    <div class="actions"><a class="btn" href="/admin-add.html">Add Admin</a></div>
-    <h1>Admins</h1>
-    <table>
-      <thead><tr><th>Email</th><th>Active</th></tr></thead>
-      <tbody id="adminRows"><tr><td colspan="2">Loading…</td></tr></tbody>
-    </table>
+    <div class="account-header">
+      <div class="account-header-main">
+        <h1>Users</h1>
+        <div class="small">Manage user access, roles, and customisations.</div>
+      </div>
+      <div class="account-header-actions">
+        <a class="btn primary" href="/admin-add.html">Add user</a>
+      </div>
+    </div>
+
+    <section>
+      <div id="usersEmptyState" class="empty-state hidden">
+        <p class="small">No users yet.</p>
+        <p><a class="btn" href="/admin-add.html">Add user</a></p>
+      </div>
+      <div id="userList" class="stacked-list"></div>
+    </section>
+
+    <section class="card" style="margin-top:16px;">
+      <h2 style="margin-top:0;">User types</h2>
+      <ul>
+        <li><strong>Super admin:</strong> Can access everything (all accounts, create/edit/remove accounts, manage all sections and items, manage all users with customisation settings, access all settings).</li>
+        <li><strong>Admin:</strong> Can access allocated accounts, create/edit/remove accounts, sections, and items, create admin and user logins for accounts they manage, and user customisations inherit the creator’s settings. Access limited settings.</li>
+        <li><strong>Standard user:</strong> Access allocated accounts, sections, and items only; no access to settings.</li>
+      </ul>
+      <p class="small">Customised label settings for users are only visible to super admins.</p>
+    </section>
   </main>
   <script type="module" src="/js/admin.js"></script>
 </body></html>
@@ -1253,23 +1349,33 @@ HTML
 cat > "$WEB_PUBLIC_DIR/admin-add.html" <<'HTML'
 <!doctype html><html><head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Add Admin</title>
+  <title>Add user</title>
   <link rel="stylesheet" href="/app.css">
 </head><body>
   <header id="site-header"></header>
   <main class="container">
-    <h1>Add Admin</h1>
-    <form id="addForm">
-      <p><input type="email" id="email" placeholder="Email" required></p>
-      <p><input type="password" id="password" placeholder="Password" required></p>
+    <h1>Add user</h1>
+    <p class="small">Create a new platform user, choose their role, and assign the accounts they can access.</p>
+    <form id="addForm" class="card" style="padding:16px;">
+      <p><label>Full name<input type="text" id="name" placeholder="Name" required></label></p>
+      <p><label>Email<input type="email" id="email" placeholder="Email" required></label></p>
+      <p><label>Password<input type="password" id="password" placeholder="Password" required></label></p>
+      <p><label>User type
+        <select id="userType">
+          <option value="super_admin">Super admin</option>
+          <option value="admin">Admin</option>
+          <option value="standard">Standard user</option>
+        </select>
+      </label></p>
       <h3>Grant access to accounts</h3>
       <p><label><input type="checkbox" id="selectAll"> Select all</label></p>
       <div id="acctGrid" class="checkbox-grid"></div>
-      <p class="small">If none selected, the admin will be created without memberships (they’ll still be an admin).</p>
-      <p><button type="submit" class="btn">Create</button></p>
+      <p class="small">If none are selected, the user will be created without memberships.</p>
+      <p class="small">Admins and super admins inherit your customisation settings when you create them.</p>
+      <p><button type="submit" class="btn primary">Create user</button></p>
+      <p id="msg" class="small"></p>
     </form>
-    <p id="msg" class="small"></p>
-    <p><a class="btn" href="/admin.html">Back to Admins</a></p>
+    <p><a class="btn" href="/admin.html">Back to users</a></p>
   </main>
   <script type="module" src="/js/admin_add.js"></script>
 </body></html>
@@ -1601,18 +1707,65 @@ import { loadMeOrRedirect, renderShell, api, getLabels } from './common.js';
 JS
 
 cat > "$WEB_JS_DIR/admin.js" <<'JS'
-import { loadMeOrRedirect, renderShell, api } from './common.js';
+import { loadMeOrRedirect, renderShell, api, DEFAULT_LABELS } from './common.js';
+
+const TYPE_LABELS = {
+  super_admin: 'Super admin',
+  admin: 'Admin',
+  standard: 'Standard user'
+};
+
 (async () => {
   const me = await loadMeOrRedirect(); if(!me) return;
   renderShell(me);
   if(!me.is_admin){ window.location.replace('/accounts.html'); return; }
 
-  const tb = document.getElementById('adminRows');
+  const list = document.getElementById('userList');
+  const emptyState = document.getElementById('usersEmptyState');
+  const showPreferences = me.user_type === 'super_admin';
+
+  function renderPrefs(user){
+    if(!showPreferences || !user.preferences) return '';
+    const prefs = user.preferences;
+    const changed = Object.entries(prefs).filter(([k,v]) => {
+      const defaultVal = DEFAULT_LABELS[k] || '';
+      return (v || '').trim() && v.trim() !== defaultVal;
+    });
+    if(!changed.length) return '<div class="small">Customised fields: none</div>';
+    const items = changed.map(([k,v]) => `<li><strong>${k.replace('_',' ')}:</strong> ${v}</li>`).join('');
+    return `<div class="small">Customised fields:<ul>${items}</ul></div>`;
+  }
+
   try {
     const users = await api('/api/admin/users');
-    tb.innerHTML = users.map(u => `<tr><td>${u.email}</td><td>${u.is_active ? 'Yes':'No'}</td></tr>`).join('') || '<tr><td colspan="2">No admins yet</td></tr>';
+    if(!users.length){
+      list.innerHTML = '';
+      emptyState.classList.remove('hidden');
+      return;
+    }
+    emptyState.classList.add('hidden');
+    list.innerHTML = users.map(u => {
+      const typeLabel = TYPE_LABELS[u.user_type] || u.user_type;
+      const status = u.is_active ? 'Active' : 'Disabled';
+      const prefs = renderPrefs(u);
+      const name = u.name?.trim() || u.email;
+      return `
+        <div class="card account-card">
+          <div>
+            <strong>${name}</strong>
+            <div class="small">${u.email}</div>
+            <div class="small">${typeLabel} • ${status}</div>
+            ${prefs}
+          </div>
+          <div>
+            <span class="pill small">${typeLabel}</span>
+          </div>
+        </div>
+      `;
+    }).join('');
   } catch(e){
-    tb.innerHTML = `<tr><td colspan="2">Failed: ${e.message}</td></tr>`;
+    list.innerHTML = `<p class="small">Failed to load users: ${e.message}</p>`;
+    emptyState.classList.add('hidden');
   }
 })();
 JS
@@ -1628,7 +1781,15 @@ import { loadMeOrRedirect, renderShell, api } from './common.js';
   const selectAll = document.getElementById('selectAll');
   const msg = document.getElementById('msg');
   const form = document.getElementById('addForm');
+  const userType = document.getElementById('userType');
+  const nameInput = document.getElementById('name');
 
+  if(me.user_type !== 'super_admin'){
+    const superOpt = userType.querySelector('option[value="super_admin"]');
+    if(superOpt) superOpt.disabled = true;
+    if(userType.value === 'super_admin') userType.value = 'admin';
+  }
+  
   try {
     const accounts = await api('/api/admin/all-accounts');
     grid.innerHTML = accounts.map(a => `
@@ -1645,16 +1806,20 @@ import { loadMeOrRedirect, renderShell, api } from './common.js';
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     msg.textContent = 'Creating…';
+    const name = nameInput.value.trim();
     const email = document.getElementById('email').value.trim();
     const password = document.getElementById('password').value;
     const selected = Array.from(grid.querySelectorAll('input[type="checkbox"]:checked')).map(cb => cb.value);
+    const role = userType.value;
+    if(!name){ msg.textContent = 'Name is required'; return; }
     try {
-      await api('/api/admin/users', { method:'POST', body: JSON.stringify({ email, password, accounts: selected }) });
-      msg.textContent = 'Admin created successfully.';
+      await api('/api/admin/users', { method:'POST', body: JSON.stringify({ name, email, password, user_type: role, accounts: selected }) });
+      msg.textContent = 'User created successfully.';
       form.reset();
       selectAll.checked = false;
+      if(me.user_type !== 'super_admin'){ userType.value = 'admin'; }
     } catch(err){
-      msg.textContent = err.message || 'Failed to create admin';
+      msg.textContent = err.message || 'Failed to create user';
     }
   });
 })();
@@ -1670,8 +1835,8 @@ import { loadMeOrRedirect, renderShell } from './common.js';
 
   const list = document.getElementById('settingsList');
   const sections = [
+    { key:'users', label:'Users', description:'Manage user roles, access, and settings.', href:'/admin.html' },
     { key:'customisation', label:'Customisation', description:'Rename UI labels for accounts, sections, and items for your user.', href:'/customisation.html' },
-    { key:'admin', label:'Admin', description:'Manage platform admins and their account access.', href:'/admin.html' },
   ];
 
   list.innerHTML = sections.map(section => `
@@ -2611,8 +2776,8 @@ Pages:
                                 → item detail (vertical layout)
   /customisation.html           → per-user label settings (admin)
   /settings.html                → settings hub (admin)
-  /admin.html                   → list admin users + "Add Admin"
-  /admin-add.html               → create admin, choose accounts
+  /admin.html                   → list users + roles, customisation visibility for super admins, link to "Add user"
+  /admin-add.html               → create user with role, name, accounts, and inherited customisations
 
 API (extended):
   POST /api/login
