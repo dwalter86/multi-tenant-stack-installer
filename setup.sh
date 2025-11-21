@@ -527,6 +527,40 @@ def set_current_account(account_id: str):
 def _schema_name(account_id: str) -> str:
   return f"tenant_{account_id.replace('-', '')}"
 
+def _ensure_schema(db, account_id: str):
+  """Ensure the per-tenant schema/table/policy exists and has section support."""
+  schema = _schema_name(account_id)
+  ensure_sql = f"""
+  DO $$
+  DECLARE sch text := '{schema}';
+  BEGIN
+    EXECUTE format('CREATE SCHEMA IF NOT EXISTS %I', sch);
+    EXECUTE format('CREATE TABLE IF NOT EXISTS %I.items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      section_slug TEXT NOT NULL DEFAULT ''default'',
+      name TEXT NOT NULL,
+      data JSONB NOT NULL DEFAULT ''{{}}'',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )', sch);
+    EXECUTE format('ALTER TABLE %I.items ADD COLUMN IF NOT EXISTS section_slug TEXT', sch);
+    EXECUTE format('UPDATE %I.items SET section_slug = ''default'' WHERE section_slug IS NULL', sch);
+    EXECUTE format('ALTER TABLE %I.items ALTER COLUMN section_slug SET DEFAULT ''default''', sch);
+    EXECUTE format('ALTER TABLE %I.items ALTER COLUMN section_slug SET NOT NULL', sch);
+    EXECUTE format('ALTER TABLE %I.items ENABLE ROW LEVEL SECURITY', sch);
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_policies
+      WHERE schemaname = sch AND tablename = 'items' AND policyname = 'items_tenant_policy'
+    ) THEN
+      EXECUTE format(
+        'CREATE POLICY items_tenant_policy ON %I.items
+         USING ( current_setting(''app.current_account'')::uuid = ''{account_id}'' )
+         WITH CHECK ( current_setting(''app.current_account'')::uuid = ''{account_id}'' )',
+        sch);
+    END IF;
+  END $$;
+  """
+  db.execute(text(ensure_sql))
+
 def list_items(account_id: str, section: str, limit: int = 50, cursor: str | None = None):
   schema = _schema_name(account_id)
   where = "WHERE section_slug = :section"
@@ -542,6 +576,7 @@ def list_items(account_id: str, section: str, limit: int = 50, cursor: str | Non
   LIMIT :limit
   """
   with SessionLocal() as db:
+    _ensure_schema(db, account_id)
     db.execute(set_current_account(account_id))
     rows = db.execute(text(sql), params).all()
     return [{"id": r[0], "name": r[1], "data": r[2], "created_at": r[3]} for r in rows]
@@ -555,6 +590,7 @@ def create_item(account_id: str, section: str, name: str, data: dict):
   """
   payload = json.dumps(data or {})
   with SessionLocal() as db:
+    _ensure_schema(db, account_id)
     db.execute(set_current_account(account_id))
     row = db.execute(text(sql), {"s": section, "n": name, "d": payload}).first()
     db.commit()
@@ -579,6 +615,7 @@ def update_item(account_id: str, item_id: str, name: str | None, data: dict | No
   RETURNING id::text, name, data, created_at
   """
   with SessionLocal() as db:
+    _ensure_schema(db, account_id)
     db.execute(set_current_account(account_id))
     row = db.execute(text(sql), params).first()
     db.commit()
@@ -590,6 +627,7 @@ def delete_item(account_id: str, item_id: str):
   schema = _schema_name(account_id)
   sql = f"DELETE FROM {schema}.items WHERE id = :id"
   with SessionLocal() as db:
+    _ensure_schema(db, account_id)
     db.execute(set_current_account(account_id))
     db.execute(text(sql), {"id": item_id})
     db.commit()
@@ -603,6 +641,7 @@ def get_item(account_id: str, item_id: str):
   LIMIT 1
   """
   with SessionLocal() as db:
+    _ensure_schema(db, account_id)
     db.execute(set_current_account(account_id))
     row = db.execute(text(sql), {"id": item_id}).first()
     if not row:
@@ -2204,15 +2243,6 @@ function escapeHtml(str){
     .replace(/&/g,'&amp;')
     .replace(/</g,'&lt;')
     .replace(/>/g,'&gt;');
-}
-
-function formatDateTime(val){
-  if(!val) return '';
-  try {
-    return new Date(val).toLocaleString();
-  } catch {
-    return escapeHtml(String(val));
-  }
 }
 
 function formatCellValue(val){
