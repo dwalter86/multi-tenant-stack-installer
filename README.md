@@ -29,13 +29,9 @@ Restart the service:
 systemctl restart stack
 ```
 
-```
-
 ## Server file layout after running `setup.sh`
 
 The installer writes everything under `/opt/stack` (owned by the invoking user) and drops a systemd unit for lifecycle management. After the script completes, the key files live at:
-
-```
 
 ```
 /opt/stack
