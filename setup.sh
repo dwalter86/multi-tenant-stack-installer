@@ -348,6 +348,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 PY
 
 cat > "$API_APP_DIR/schemas.py" <<'PY'
+from datetime import datetime
 from pydantic import BaseModel, EmailStr, Field
 from typing import Optional, List, Literal
 
@@ -395,6 +396,7 @@ class ItemOut(BaseModel):
     id: str
     name: str
     data: dict
+    created_at: datetime
 
 class ItemsPage(BaseModel):
     items: List[ItemOut]
@@ -533,7 +535,7 @@ def list_items(account_id: str, section: str, limit: int = 50, cursor: str | Non
     where += " AND id > :cursor"
     params["cursor"] = cursor
   sql = f"""
-  SELECT id::text, name, COALESCE(data, '{{}}'::jsonb)
+  SELECT id::text, name, COALESCE(data, '{{}}'::jsonb), created_at
   FROM {schema}.items
   {where}
   ORDER BY id
@@ -542,21 +544,21 @@ def list_items(account_id: str, section: str, limit: int = 50, cursor: str | Non
   with SessionLocal() as db:
     db.execute(set_current_account(account_id))
     rows = db.execute(text(sql), params).all()
-    return [{"id": r[0], "name": r[1], "data": r[2]} for r in rows]
+    return [{"id": r[0], "name": r[1], "data": r[2], "created_at": r[3]} for r in rows]
 
 def create_item(account_id: str, section: str, name: str, data: dict):
   schema = _schema_name(account_id)
   sql = f"""
   INSERT INTO {schema}.items (section_slug, name, data)
   VALUES (:s, :n, CAST(:d AS jsonb))
-  RETURNING id::text, name, data
+  RETURNING id::text, name, data, created_at
   """
   payload = json.dumps(data or {})
   with SessionLocal() as db:
     db.execute(set_current_account(account_id))
     row = db.execute(text(sql), {"s": section, "n": name, "d": payload}).first()
     db.commit()
-    return {"id": row[0], "name": row[1], "data": row[2]}
+    return {"id": row[0], "name": row[1], "data": row[2], "created_at": row[3]}
 
 def update_item(account_id: str, item_id: str, name: str | None, data: dict | None):
   schema = _schema_name(account_id)
@@ -574,7 +576,7 @@ def update_item(account_id: str, item_id: str, name: str | None, data: dict | No
   UPDATE {schema}.items
   SET {', '.join(sets)}
   WHERE id = :id
-  RETURNING id::text, name, data
+  RETURNING id::text, name, data, created_at
   """
   with SessionLocal() as db:
     db.execute(set_current_account(account_id))
@@ -582,7 +584,7 @@ def update_item(account_id: str, item_id: str, name: str | None, data: dict | No
     db.commit()
     if not row:
       return None
-    return {"id": row[0], "name": row[1], "data": row[2]}
+    return {"id": row[0], "name": row[1], "data": row[2], "created_at": row[3]}
 
 def delete_item(account_id: str, item_id: str):
   schema = _schema_name(account_id)
@@ -595,7 +597,7 @@ def delete_item(account_id: str, item_id: str):
 def get_item(account_id: str, item_id: str):
   schema = _schema_name(account_id)
   sql = f"""
-  SELECT id::text, name, COALESCE(data, '{{}}'::jsonb), section_slug
+  SELECT id::text, name, COALESCE(data, '{{}}'::jsonb), section_slug, created_at
   FROM {schema}.items
   WHERE id = :id
   LIMIT 1
@@ -605,7 +607,7 @@ def get_item(account_id: str, item_id: str):
     row = db.execute(text(sql), {"id": item_id}).first()
     if not row:
       return None
-    return {"id": row[0], "name": row[1], "data": row[2], "section_slug": row[3]}
+    return {"id": row[0], "name": row[1], "data": row[2], "section_slug": row[3], "created_at": row[4]}
 PY
 
 cat > "$API_APP_DIR/main.py" <<'PY'
@@ -1033,6 +1035,11 @@ footer { border-top:1px solid var(--border); border-bottom:none; color:var(--mut
 main.container { padding-top:24px; padding-bottom:24px; background:var(--card); border:1px solid var(--border); border-radius:10px; margin-top:16px; }
 table { width:100%; border-collapse:collapse; }
 th, td { padding:8px; border-bottom:1px solid var(--border); text-align:left; vertical-align:top; }
+.sort-header { display:flex; align-items:center; gap:6px; }
+.sort-controls { display:flex; gap:2px; }
+.sort-btn { border:1px solid var(--border); background:#fff; padding:2px 6px; border-radius:4px; cursor:pointer; }
+.sort-btn.active { background:#eef3ff; border-color:#8aa2ff; }
+.sort-btn:focus-visible { outline:2px solid #8aa2ff; outline-offset:2px; }
 .actions { display:flex; justify-content:flex-end; margin:8px 0; gap:8px; }
 .checkbox-grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(260px,1fr)); gap:8px; }
 .small { color:var(--muted); font-size:.9em; }
@@ -1210,6 +1217,28 @@ export function getLabels(user){
   };
 }
 
+function columnPrefKey(accountId, sectionSlug){
+  return `columnPrefs:${accountId}:${sectionSlug}`;
+}
+
+export function loadColumnPrefs(accountId, sectionSlug){
+  try{
+    const raw = localStorage.getItem(columnPrefKey(accountId, sectionSlug));
+    if(!raw) return null;
+    return JSON.parse(raw);
+  }catch{
+    return null;
+  }
+}
+
+export function saveColumnPrefs(accountId, sectionSlug, prefs){
+  try{
+    localStorage.setItem(columnPrefKey(accountId, sectionSlug), JSON.stringify(prefs||{}));
+  }catch{
+    // ignore storage errors
+  }
+}
+
 export async function api(path, opts={}){
   const headers = Object.assign({ 'Content-Type':'application/json' }, opts.headers||{});
   const token = getToken();
@@ -1236,9 +1265,8 @@ export function renderShell(user){
   const footer = document.getElementById('site-footer');
   if(header){
     header.innerHTML = `
-      <div class="container" style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
-        <div class="brand">ADIGI One Platform</div>
-        <nav class="menu">
+      <div class="container" style="display:flex;justify-content:flex-start;align-items:center;gap:12px;">
+        <nav class="menu" style="margin-left:0;">
           <span class="pill small">${user?.email||''}</span>
           <a href="/accounts.html">Home</a>
           ${user?.is_admin ? '<a href="/settings.html">Settings</a>' : ''}
@@ -1500,6 +1528,7 @@ cat > "$WEB_PUBLIC_DIR/section.html" <<'HTML'
         <div id="sectionMenu" class="dropdown-menu">
           <button type="button" data-action="edit" id="editSectionMenuLabel">Edit section</button>
           <button type="button" data-action="add-item" id="addItemMenuLabel">Add item</button>
+          <button type="button" data-action="column-settings" id="columnSettingsMenuLabel">Settings</button>
           <button type="button" data-action="delete" class="danger" id="deleteSectionMenuLabel">Delete section</button>
         </div>
       </div>
@@ -1508,7 +1537,6 @@ cat > "$WEB_PUBLIC_DIR/section.html" <<'HTML'
     <section class="card">
       <div class="actions" style="margin-top:0;margin-bottom:8px;justify-content:space-between;">
         <h2 style="margin:0;" id="itemsHeading">Items</h2>
-        <button id="addItemButton" class="btn">Add item</button>
       </div>
       <div id="itemsEmptyState" class="empty-state hidden">
         <p class="small" id="itemsEmptyCopy">No items in this section yet.</p>
@@ -1549,6 +1577,38 @@ cat > "$WEB_PUBLIC_DIR/section.html" <<'HTML'
     </div>
   </main>
   <script type="module" src="/js/section.js"></script>
+</body></html>
+HTML
+
+# Item columns visibility page
+cat > "$WEB_PUBLIC_DIR/items-settings.html" <<'HTML'
+<!doctype html><html><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Item column settings</title>
+  <link rel="stylesheet" href="/app.css">
+</head><body>
+  <header id="site-header"></header>
+  <main class="container">
+    <div class="account-header">
+      <div class="account-header-main">
+        <a class="btn" href="#" id="backToItems">Back</a>
+        <div>
+          <h1>Item columns</h1>
+          <p class="small">Choose which columns appear on the items table.</p>
+        </div>
+      </div>
+    </div>
+
+    <section class="card">
+      <div id="columnsForm"></div>
+      <div class="actions" style="justify-content:space-between;">
+        <p id="columnsStatus" class="small" style="margin:0;">Changes save instantly for this section.</p>
+        <button type="button" class="btn" id="restoreColumns">Restore defaults</button>
+      </div>
+      <p class="small">Settings only affect the main items list, not the full item view.</p>
+    </section>
+  </main>
+  <script type="module" src="/js/items_settings.js"></script>
 </body></html>
 HTML
 
@@ -2127,7 +2187,7 @@ JS
 
 # Section page logic (schema-driven table + modal + menu)
 cat > "$WEB_JS_DIR/section.js" <<'JS'
-import { loadMeOrRedirect, renderShell, api, getLabels } from './common.js';
+import { loadMeOrRedirect, renderShell, api, getLabels, loadColumnPrefs } from './common.js';
 
 function qs(name){
   const m = new URLSearchParams(location.search).get(name);
@@ -2152,6 +2212,15 @@ function formatCellValue(val){
     }
   }
   return escapeHtml(String(val));
+}
+
+function formatDateTime(val){
+  if(!val) return '';
+  try {
+    return new Date(val).toLocaleString();
+  } catch {
+    return escapeHtml(String(val));
+  }
 }
 
 function parseLooseValue(str){
@@ -2182,7 +2251,6 @@ function parseLooseValue(str){
   const metaEl = document.getElementById('sectionMeta');
   const itemsEmptyState = document.getElementById('itemsEmptyState');
   const itemsTableContainer = document.getElementById('itemsTableContainer');
-  const addItemButton = document.getElementById('addItemButton');
   const emptyAddItemButton = document.getElementById('emptyAddItemButton');
   const itemsHeading = document.getElementById('itemsHeading');
   const itemsEmptyCopy = document.getElementById('itemsEmptyCopy');
@@ -2192,6 +2260,7 @@ function parseLooseValue(str){
   const menu = document.getElementById('sectionMenu');
   const editSectionMenuLabel = document.getElementById('editSectionMenuLabel');
   const addItemMenuLabel = document.getElementById('addItemMenuLabel');
+  const columnSettingsMenuLabel = document.getElementById('columnSettingsMenuLabel');
   const deleteSectionMenuLabel = document.getElementById('deleteSectionMenuLabel');
 
   const itemModal = document.getElementById('itemModal');
@@ -2205,11 +2274,11 @@ function parseLooseValue(str){
   const addKVRowBtn = document.getElementById('addKVRowBtn');
 
   if(itemsHeading){ itemsHeading.textContent = labels.items_label; }
-  if(addItemButton){ addItemButton.textContent = `Add ${labels.items_label}`; }
   if(emptyAddItemButton){ emptyAddItemButton.textContent = `Add your first ${labels.items_label.toLowerCase()}`; }
   if(itemsEmptyCopy){ itemsEmptyCopy.textContent = `No ${labels.items_label.toLowerCase()} in this ${labels.sections_label.toLowerCase()} yet.`; }
   if(editSectionMenuLabel){ editSectionMenuLabel.textContent = `Edit ${labels.sections_label}`; }
   if(addItemMenuLabel){ addItemMenuLabel.textContent = `Add ${labels.items_label}`; }
+  if(columnSettingsMenuLabel){ columnSettingsMenuLabel.textContent = 'Settings'; }
   if(deleteSectionMenuLabel){ deleteSectionMenuLabel.textContent = `Delete ${labels.sections_label}`; }
   if(itemModalTitle){ itemModalTitle.textContent = `Add ${labels.items_label}`; }
 
@@ -2228,6 +2297,9 @@ function parseLooseValue(str){
 
   let currentSection = null;
   let schemaFields = []; // section.schema.fields || []
+  let itemsCache = [];
+  let columnDefs = [];
+  let sortState = { key: 'created_at', direction: 'desc' };
 
   async function loadSectionMeta(){
     try {
@@ -2280,32 +2352,24 @@ function parseLooseValue(str){
     itemForm.reset();
     // Setup UI depending on schema
     if(schemaFields && schemaFields.length){
-      schemaFieldsContainer.innerHTML = schemaFields.map(f => {
-        const type = (f.type || 'text').toLowerCase();
-        const required = f.required ? 'required' : '';
-        const keyAttr = `data-key="${escapeHtml(f.key)}" data-type="${escapeHtml(type)}"`;
-        if(type === 'textarea'){
-          return `<p><label>${escapeHtml(f.label || f.key)}<textarea ${keyAttr} ${required}></textarea></label></p>`;
-        } else if(type === 'select' && Array.isArray(f.options)) {
-          const opts = f.options.map(o => `<option value="${escapeHtml(String(o))}">${escapeHtml(String(o))}</option>`).join('');
-          return `<p><label>${escapeHtml(f.label || f.key)}<select ${keyAttr} ${required}>${opts}</select></label></p>`;
-        } else if(type === 'checkbox') {
-          return `<p><label><input type="checkbox" ${keyAttr}> ${escapeHtml(f.label || f.key)}</label></p>`;
-        } else {
-          return `<p><label>${escapeHtml(f.label || f.key)}<input type="text" ${keyAttr} ${required}></label></p>`;
-        }
-      }).join('');
       schemaFieldsContainer.classList.remove('hidden');
       kvEditorContainer.classList.add('hidden');
+      schemaFieldsContainer.innerHTML = schemaFields.map(f => {
+        const key = escapeHtml(f.key || '');
+        const label = escapeHtml(f.label || key);
+        const type = (f.type || 'text').toLowerCase();
+        if(type === 'checkbox'){
+          return `<p><label>${label} <input type="checkbox" data-key="${key}" data-type="checkbox"></label></p>`;
+        }
+        return `<p><label>${label}<input type="text" data-key="${key}" data-type="${type}"></label></p>`;
+      }).join('');
     } else {
-      // Fallback key/value editor
       schemaFieldsContainer.classList.add('hidden');
       kvEditorContainer.classList.remove('hidden');
       kvRowsTbody.innerHTML = '';
       addKVRow();
     }
     itemModal.classList.remove('hidden');
-    setTimeout(() => itemNameInput.focus(), 0);
   }
 
   function closeItemModal(){
@@ -2336,12 +2400,6 @@ function parseLooseValue(str){
     });
   }
 
-  if(addItemButton){
-    addItemButton.addEventListener('click', (e) => {
-      e.preventDefault();
-      openItemModal();
-    });
-  }
   if(emptyAddItemButton){
     emptyAddItemButton.addEventListener('click', (e) => {
       e.preventDefault();
@@ -2356,90 +2414,139 @@ function parseLooseValue(str){
     });
   }
 
+  function buildColumns(items){
+    const cols = [
+      { key: 'name', label: 'Name', getValue: (it) => it.name },
+      { key: 'created_at', label: 'Date added', getValue: (it) => it.created_at },
+    ];
+
+    if(schemaFields && schemaFields.length){
+      const visibleFields = schemaFields.filter(f => f.showInTable !== false);
+      visibleFields.forEach(f => {
+        cols.push({
+          key: f.key,
+          label: f.label || f.key,
+          getValue: (it) => it.data && typeof it.data === 'object' ? it.data[f.key] : undefined
+        });
+      });
+    } else {
+      const keySet = new Set();
+      for(const it of items){
+        if(it.data && typeof it.data === 'object'){
+          Object.keys(it.data).forEach(k => keySet.add(k));
+        }
+      }
+      let keys = Array.from(keySet);
+      const priority = ['title','name','label'];
+      keys.sort((a,b) => {
+        const ia = priority.indexOf(a.toLowerCase());
+        const ib = priority.indexOf(b.toLowerCase());
+        if(ia !== -1 && ib === -1) return -1;
+        if(ib !== -1 && ia === -1) return 1;
+        return a.localeCompare(b);
+      });
+      const MAX_COLS = 8;
+      if(keys.length > MAX_COLS) keys = keys.slice(0, MAX_COLS);
+      keys.forEach(k => cols.push({ key: k, label: k, getValue: (it) => it.data && typeof it.data === 'object' ? it.data[k] : undefined }));
+    }
+
+    return cols;
+  }
+
+  function getVisibleColumns(allColumns){
+    const prefs = loadColumnPrefs(accountId, slug);
+    if(prefs && Array.isArray(prefs.visible) && prefs.visible.length){
+      const allowed = new Set(prefs.visible);
+      const filtered = allColumns.filter(c => allowed.has(c.key));
+      if(filtered.length) return filtered;
+    }
+    return allColumns;
+  }
+
+  function ensureSortTarget(columns){
+    if(!columns.some(c => c.key === sortState.key)){
+      sortState = { key: columns[0]?.key || 'name', direction: 'asc' };
+    }
+  }
+
+  function compareValues(a, b, key){
+    if(key === 'created_at'){
+      const ad = new Date(a || 0);
+      const bd = new Date(b || 0);
+      return ad - bd;
+    }
+    if(typeof a === 'number' && typeof b === 'number') return a - b;
+    if(a === b) return 0;
+    if(a === undefined || a === null) return -1;
+    if(b === undefined || b === null) return 1;
+    return String(a).localeCompare(String(b));
+  }
+  
+  function sortItems(items, columns){
+    ensureSortTarget(columns);
+    const col = columns.find(c => c.key === sortState.key) || columns[0];
+    const dir = sortState.direction === 'desc' ? -1 : 1;
+    return [...items].sort((a,b) => compareValues(col.getValue(a), col.getValue(b), col.key) * dir);
+  }
+  
+  function renderHeaderCell(col){
+    const ascActive = sortState.key === col.key && sortState.direction === 'asc';
+    const descActive = sortState.key === col.key && sortState.direction === 'desc';
+    return `<th><div class="sort-header"><span>${escapeHtml(col.label)}</span><div class="sort-controls"><button type="button" class="sort-btn ${ascActive?'active':''}" data-sort-key="${escapeHtml(col.key)}" data-sort-dir="asc">▲</button><button type="button" class="sort-btn ${descActive?'active':''}" data-sort-key="${escapeHtml(col.key)}" data-sort-dir="desc">▼</button></div></div></th>`;
+  }
+
+  function formatForDisplay(col, item){
+    const val = col.getValue(item);
+    if(col.key === 'name') return escapeHtml(val || '');
+    if(col.key === 'created_at') return formatDateTime(val);
+    return formatCellValue(val);
+  }
+
+  function renderItemsTable(items, allColumns){
+    const columns = getVisibleColumns(allColumns);
+    if(!columns.length){
+      return '<p class="small">Select at least one column to view items.</p>';
+    }
+    ensureSortTarget(columns);
+    const sortedItems = sortItems(items, columns);
+    const headerHtml = columns.map(renderHeaderCell).join('') + '<th></th>';
+    const rowsHtml = sortedItems.map(it => {
+      const cells = columns.map(col => `<td>${formatForDisplay(col, it)}</td>`).join('');
+      const viewHref = `/item.html?account=${encodeURIComponent(accountId)}&section=${encodeURIComponent(slug)}&item=${encodeURIComponent(it.id)}`;
+      return `<tr>${cells}<td style="width:1%;white-space:nowrap;"><a class="btn small" href="${viewHref}">View</a></td></tr>`;
+    }).join('');
+
+    return `<div class="table-wrapper"><table><thead><tr>${headerHtml}</tr></thead><tbody>${rowsHtml}</tbody></table></div>`;
+  }
+
   async function loadItems(){
     try{
       const page = await api(`/api/accounts/${accountId}/sections/${encodeURIComponent(slug)}/items?limit=200`);
-      const items = page.items || [];
-      if(!items.length){
+      itemsCache = page.items || [];
+      if(!itemsCache.length){
         itemsEmptyState.classList.remove('hidden');
         itemsTableContainer.innerHTML = '';
         return;
       }
       itemsEmptyState.classList.add('hidden');
-      const html = renderItemsTable(items);
+      columnDefs = buildColumns(itemsCache);
+      const html = renderItemsTable(itemsCache, columnDefs);
       itemsTableContainer.innerHTML = html;
     }catch(e){
       itemsTableContainer.innerHTML = `<p class="small">Failed to load items: ${e.message}</p>`;
       itemsEmptyState.classList.add('hidden');
     }
   }
-
-  function renderItemsTable(items){
-    const hasSchema = schemaFields && schemaFields.length;
-    if(hasSchema){
-      return renderSchemaTable(items, schemaFields);
+  
+  itemsTableContainer.addEventListener('click', (e) => {
+    const btn = e.target.closest('.sort-btn');
+    if(!btn) return;
+    sortState = { key: btn.dataset.sortKey, direction: btn.dataset.sortDir };
+    if(itemsCache.length && columnDefs.length){
+      const html = renderItemsTable(itemsCache, columnDefs);
+      itemsTableContainer.innerHTML = html;
     }
-    return renderAutoTable(items);
-  }
-
-  function renderSchemaTable(items, fields){
-    const visibleFields = fields.filter(f => f.showInTable !== false);
-    const headers = ['Name', ...visibleFields.map(f => f.label || f.key), ''];
-    const headerHtml = '<tr>' + headers.map(h => `<th>${escapeHtml(h)}</th>`).join('') + '</tr>';
-    const rowsHtml = items.map(it => {
-      const cells = [];
-      cells.push(`<td>${escapeHtml(it.name)}</td>`);
-      for(const f of visibleFields){
-        const key = f.key;
-        const val = it.data && typeof it.data === 'object' ? it.data[key] : undefined;
-        cells.push(`<td>${formatCellValue(val)}</td>`);
-      }
-      const viewHref = `/item.html?account=${encodeURIComponent(accountId)}&section=${encodeURIComponent(slug)}&item=${encodeURIComponent(it.id)}`;
-      cells.push(`<td style="width:1%;white-space:nowrap;"><a class="btn small" href="${viewHref}">View</a></td>`);
-      return `<tr>${cells.join('')}</tr>`;
-    }).join('');
-
-    return `<div class="table-wrapper"><table><thead>${headerHtml}</thead><tbody>${rowsHtml}</tbody></table></div>`;
-  }
-
-  function renderAutoTable(items){
-    const keySet = new Set();
-    for(const it of items){
-      if(it.data && typeof it.data === 'object'){
-        Object.keys(it.data).forEach(k => keySet.add(k));
-      }
-    }
-    let keys = Array.from(keySet);
-    // Optional: move common keys to front
-    const priority = ['title','name','label'];
-    keys.sort((a,b) => {
-      const ia = priority.indexOf(a.toLowerCase());
-      const ib = priority.indexOf(b.toLowerCase());
-      if(ia !== -1 && ib === -1) return -1;
-      if(ib !== -1 && ia === -1) return 1;
-      return a.localeCompare(b);
-    });
-    // Limit columns to avoid over-wide tables
-    const MAX_COLS = 8;
-    if(keys.length > MAX_COLS) keys = keys.slice(0, MAX_COLS);
-
-    const headers = ['Name', ...keys, ''];
-    const headerHtml = '<tr>' + headers.map(h => `<th>${escapeHtml(h)}</th>`).join('') + '</tr>';
-
-    const rowsHtml = items.map(it => {
-      const cells = [];
-      cells.push(`<td>${escapeHtml(it.name)}</td>`);
-      for(const k of keys){
-        const val = it.data && typeof it.data === 'object' ? it.data[k] : undefined;
-        cells.push(`<td>${formatCellValue(val)}</td>`);
-      }
-      const viewHref = `/item.html?account=${encodeURIComponent(accountId)}&section=${encodeURIComponent(slug)}&item=${encodeURIComponent(it.id)}`;
-      cells.push(`<td style="width:1%;white-space:nowrap;"><a class="btn small" href="${viewHref}">View</a></td>`);
-      return `<tr>${cells.join('')}</tr>`;
-    }).join('');
-
-    return `<div class="table-wrapper"><table><thead>${headerHtml}</thead><tbody>${rowsHtml}</tbody></table></div>`;
-  }
+  });
 
   // Item form submit
   itemForm.addEventListener('submit', async (e) => {
@@ -2498,6 +2605,8 @@ function parseLooseValue(str){
 
     if(action === 'add-item'){
       openItemModal();
+    } else if(action === 'column-settings'){
+      window.location.href = `/items-settings.html?account=${encodeURIComponent(accountId)}&slug=${encodeURIComponent(slug)}`;
     } else if(action === 'edit'){
       const currentLabel = currentSection?.label || slug;
       const next = prompt('Section name', currentLabel);
@@ -2515,12 +2624,11 @@ function parseLooseValue(str){
         alert(err.message || 'Failed to update section');
       }
     } else if(action === 'delete'){
-      if(!confirm('Delete this section and all its items? This cannot be undone.')){
-        return;
-      }
+      const confirmed = confirm('Delete this section? Items will also be deleted.');
+      if(!confirmed) return;
       try {
         await api(`/api/accounts/${accountId}/sections/${encodeURIComponent(slug)}`, { method:'DELETE' });
-        window.location.replace(`/account.html?id=${encodeURIComponent(accountId)}`);
+        window.location.href = `/account.html?id=${encodeURIComponent(accountId)}`;
       } catch(err){
         alert(err.message || 'Failed to delete section');
       }
@@ -2529,6 +2637,146 @@ function parseLooseValue(str){
 
   await loadSectionMeta();
   await loadItems();
+})();
+JS
+
+cat > "$WEB_JS_DIR/items_settings.js" <<'JS'
+import { loadMeOrRedirect, renderShell, api, getLabels, loadColumnPrefs, saveColumnPrefs } from './common.js';
+
+function qs(name){
+  const m = new URLSearchParams(location.search).get(name);
+  return m && decodeURIComponent(m);
+}
+
+function escapeHtml(str){
+  return String(str ?? '')
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;');
+}
+
+function buildColumns(schemaFields, items){
+  const cols = [
+    { key: 'name', label: 'Name' },
+    { key: 'created_at', label: 'Date added' },
+  ];
+
+  if(schemaFields && schemaFields.length){
+    const visibleFields = schemaFields.filter(f => f.showInTable !== false);
+    visibleFields.forEach(f => cols.push({ key: f.key, label: f.label || f.key }));
+  } else {
+    const keySet = new Set();
+    for(const it of items){
+      if(it.data && typeof it.data === 'object'){
+        Object.keys(it.data).forEach(k => keySet.add(k));
+      }
+    }
+    let keys = Array.from(keySet);
+    const priority = ['title','name','label'];
+    keys.sort((a,b) => {
+      const ia = priority.indexOf(a.toLowerCase());
+      const ib = priority.indexOf(b.toLowerCase());
+      if(ia !== -1 && ib === -1) return -1;
+      if(ib !== -1 && ia === -1) return 1;
+      return a.localeCompare(b);
+    });
+    const MAX_COLS = 8;
+    if(keys.length > MAX_COLS) keys = keys.slice(0, MAX_COLS);
+    keys.forEach(k => cols.push({ key: k, label: k }));
+  }
+
+  return cols;
+}
+
+(async () => {
+  const me = await loadMeOrRedirect(); if(!me) return;
+  renderShell(me);
+  const labels = getLabels(me);
+
+  const accountId = qs('account');
+  const slug = qs('slug');
+  if(!accountId || !slug){
+    document.body.innerHTML = '<main class="container"><p>Missing account or section.</p></main>';
+    return;
+  }
+
+  const backToItems = document.getElementById('backToItems');
+  const form = document.getElementById('columnsForm');
+  const statusEl = document.getElementById('columnsStatus');
+  const restoreBtn = document.getElementById('restoreColumns');
+
+  if(backToItems){
+    backToItems.href = `/section.html?account=${encodeURIComponent(accountId)}&slug=${encodeURIComponent(slug)}`;
+  }
+
+  let schemaFields = [];
+  let items = [];
+  let sectionLabel = slug;
+
+  try {
+    const section = await api(`/api/accounts/${accountId}/sections/${encodeURIComponent(slug)}`);
+    const s = section.schema || {};
+    schemaFields = Array.isArray(s.fields) ? s.fields : [];
+    sectionLabel = section.label || slug;
+  } catch {
+    schemaFields = [];
+  }
+
+  try {
+    const page = await api(`/api/accounts/${accountId}/sections/${encodeURIComponent(slug)}/items?limit=200`);
+    items = page.items || [];
+  } catch {
+    items = [];
+  }
+
+  const columns = buildColumns(schemaFields, items);
+  const pref = loadColumnPrefs(accountId, slug) || {};
+  let visible = Array.isArray(pref.visible) && pref.visible.length ? pref.visible : columns.map(c => c.key);
+  const selection = new Set(visible);
+
+  if(statusEl){
+    statusEl.textContent = `${columns.length} column${columns.length === 1 ? '' : 's'} available for ${sectionLabel}.`;
+  }
+  document.title = `${labels.items_label} columns | ${sectionLabel}`;
+
+  function renderForm(){
+    form.innerHTML = '<div class="checkbox-grid">' + columns.map(c => {
+      const checked = selection.has(c.key) ? 'checked' : '';
+      return `<label><input type="checkbox" data-key="${escapeHtml(c.key)}" ${checked}> ${escapeHtml(c.label)}</label>`;
+    }).join('') + '</div>';
+  }
+
+  function persist(){
+    if(!selection.size){
+      // Always keep at least the name column visible
+      selection.add('name');
+    }
+    saveColumnPrefs(accountId, slug, { visible: Array.from(selection) });
+  }
+
+  form.addEventListener('change', (e) => {
+    const input = e.target.closest('input[data-key]');
+    if(!input) return;
+    const key = input.getAttribute('data-key');
+    if(input.checked){
+      selection.add(key);
+    } else {
+      selection.delete(key);
+    }
+    persist();
+    renderForm();
+  });
+
+  if(restoreBtn){
+    restoreBtn.addEventListener('click', () => {
+      selection.clear();
+      columns.forEach(c => selection.add(c.key));
+      persist();
+      renderForm();
+    });
+  }
+
+  renderForm();
 })();
 JS
 
@@ -2615,7 +2863,8 @@ function formatValue(val){
     const item = await api(`/api/accounts/${accountId}/items/${encodeURIComponent(itemId)}`);
     itemNameEl.textContent = item.name;
     const sectionLabel = section ? section.label : (sectionSlug || 'No section');
-    itemMetaEl.textContent = `${accountName} · ${labels.sections_label}: ${sectionLabel} · id: ${itemId}`;
+    const createdCopy = item.created_at ? ` · Created: ${formatDateTime(item.created_at)}` : '';
+    itemMetaEl.textContent = `${accountName} · ${labels.sections_label}: ${sectionLabel}${createdCopy} · id: ${itemId}`;
     document.title = `${item.name} | ${labels.items_label}`;
 
     const data = item.data || {};
