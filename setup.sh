@@ -1056,8 +1056,8 @@ export function renderShell(user){
         <div class="brand">ADIGI One Platform</div>
         <nav class="menu">
           <span class="pill small">${user?.email||''}</span>
-          <a href="/accounts.html">Accounts</a>
-          ${user?.is_admin ? '<a href="/admin.html">Admin</a>' : ''}
+          <a href="/accounts.html">Home</a>
+          ${user?.is_admin ? '<a href="/settings.html">Settings</a>' : ''}
           <a href="#" id="logoutBtn" class="btn">Logout</a>
         </nav>
       </div>`;
@@ -1167,6 +1167,23 @@ cat > "$WEB_PUBLIC_DIR/admin-add.html" <<'HTML'
   </main>
   <footer id="site-footer"></footer>
   <script type="module" src="/js/admin_add.js"></script>
+</body></html>
+HTML
+
+cat > "$WEB_PUBLIC_DIR/settings.html" <<'HTML'
+<!doctype html><html><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Settings</title>
+  <link rel="stylesheet" href="/app.css">
+</head><body>
+  <header id="site-header"></header>
+  <main class="container">
+    <h1>Settings</h1>
+    <p class="small">Choose a settings area to manage.</p>
+    <div id="settingsList" class="stacked-list"></div>
+  </main>
+  <footer id="site-footer"></footer>
+  <script type="module" src="/js/settings.js"></script>
 </body></html>
 HTML
 
@@ -1505,6 +1522,31 @@ import { loadMeOrRedirect, renderShell, api } from './common.js';
       msg.textContent = err.message || 'Failed to create admin';
     }
   });
+})();
+JS
+
+cat > "$WEB_JS_DIR/settings.js" <<'JS'
+import { loadMeOrRedirect, renderShell } from './common.js';
+
+(async () => {
+  const me = await loadMeOrRedirect(); if(!me) return;
+  renderShell(me);
+  if(!me.is_admin){ window.location.replace('/accounts.html'); return; }
+
+  const list = document.getElementById('settingsList');
+  const sections = [
+    { key:'admin', label:'Admin', description:'Manage platform admins and their account access.', href:'/admin.html' },
+  ];
+
+  list.innerHTML = sections.map(section => `
+    <div class="card account-card">
+      <div>
+        <strong>${section.label}</strong>
+        <div class="small">${section.description}</div>
+      </div>
+      <div><a class="btn" href="${section.href}">Open</a></div>
+    </div>
+  `).join('');
 })();
 JS
 
@@ -2337,6 +2379,7 @@ Pages:
                                 → schema-driven items table + 3-dot menu + item modal
   /item.html?account=<ACCOUNT_ID>&section=<SLUG>&item=<ITEM_ID>
                                 → item detail (vertical layout)
+  /settings.html                → settings hub (admin)
   /admin.html                   → list admin users + "Add Admin"
   /admin-add.html               → create admin, choose accounts
 
