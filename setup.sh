@@ -275,6 +275,34 @@ cat > "$DB_INIT_DIR/003_admin_column.sql" <<'SQL'
 ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;
 SQL
 
+cat > "$DB_INIT_DIR/004_user_preferences.sql" <<'SQL'
+CREATE TABLE IF NOT EXISTS user_preferences (
+  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  ui_labels JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE OR REPLACE FUNCTION set_user_preferences_updated_at()
+RETURNS trigger AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger WHERE tgname = 'user_preferences_updated_at'
+  ) THEN
+    CREATE TRIGGER user_preferences_updated_at
+    BEFORE UPDATE ON user_preferences
+    FOR EACH ROW EXECUTE PROCEDURE set_user_preferences_updated_at();
+  END IF;
+END;$$;
+SQL
+
 # --- API ---
 cat > "$API_DIR/Dockerfile" <<'DOCKER'
 FROM python:3.11-slim
@@ -313,10 +341,21 @@ class LoginRequest(BaseModel):
     email: EmailStr
     password: str
 
+class Preferences(BaseModel):
+    accounts_label: str = "Home"
+    sections_label: str = "Sections"
+    items_label: str = "Items"
+
+class PreferencesUpdate(BaseModel):
+    accounts_label: Optional[str] = None
+    sections_label: Optional[str] = None
+    items_label: Optional[str] = None
+
 class MeOut(BaseModel):
     id: str
     email: EmailStr
     is_admin: bool
+    preferences: Preferences = Preferences()
 
 class AccountOut(BaseModel):
     id: str
@@ -554,12 +593,42 @@ from schemas import (
     SectionCreate,
     SectionUpdate,
     SectionOut,
+    Preferences,
+    PreferencesUpdate,
 )
 from auth import login_and_get_user, create_token, memberships_for_user
 from deps import current_user, ip_allowlist, require_admin
 import rls
 from sqlalchemy import text
 from database import SessionLocal
+
+DEFAULT_LABELS: dict[str, str] = {
+  "accounts_label": "Home",
+  "sections_label": "Sections",
+  "items_label": "Items",
+}
+
+def merge_labels(raw: dict | None) -> dict:
+  merged = dict(DEFAULT_LABELS)
+  if isinstance(raw, dict):
+    for key, val in raw.items():
+      if key in merged and isinstance(val, str) and val.strip():
+        merged[key] = val.strip()
+  return merged
+
+def get_preferences(db, user_id: str) -> dict:
+  row = db.execute(text("SELECT ui_labels FROM user_preferences WHERE user_id=:u LIMIT 1"), {"u": user_id}).first()
+  return merge_labels(row[0] if row else None)
+
+def save_preferences(db, user_id: str, labels: dict) -> dict:
+  merged = merge_labels(labels)
+  db.execute(text("""
+    INSERT INTO user_preferences(user_id, ui_labels)
+    VALUES (:u, CAST(:l AS jsonb))
+    ON CONFLICT (user_id) DO UPDATE SET ui_labels = EXCLUDED.ui_labels
+  """), {"u": user_id, "l": json.dumps(merged)})
+  db.commit()
+  return merged
 
 app = FastAPI(title="Multi-tenant JSON API")
 app.add_middleware(
@@ -583,7 +652,31 @@ async def me(user_id: str = Depends(current_user)):
     row = db.execute(text("SELECT id::text, email, is_admin FROM users WHERE id=:u"), {"u": user_id}).first()
     if not row:
       raise HTTPException(status_code=404, detail="User not found")
-    return MeOut(id=row[0], email=row[1], is_admin=bool(row[2]))
+    prefs = get_preferences(db, user_id)
+    return MeOut(id=row[0], email=row[1], is_admin=bool(row[2]), preferences=Preferences(**prefs))
+
+@app.get("/api/me/preferences", response_model=Preferences, dependencies=[Depends(ip_allowlist)])
+async def read_preferences(user_id: str = Depends(current_user)):
+  with SessionLocal() as db:
+    prefs = get_preferences(db, user_id)
+    return Preferences(**prefs)
+
+@app.put("/api/me/preferences", response_model=Preferences, dependencies=[Depends(ip_allowlist)])
+async def update_preferences(body: PreferencesUpdate, user_id: str = Depends(current_user)):
+  updates: dict[str, str] = {}
+  for field in ("accounts_label", "sections_label", "items_label"):
+    val = getattr(body, field)
+    if val is not None:
+      cleaned = val.strip()
+      if not cleaned:
+        raise HTTPException(status_code=400, detail=f"{field.replace('_', ' ').title()} cannot be empty")
+      updates[field] = cleaned
+
+  with SessionLocal() as db:
+    current = get_preferences(db, user_id)
+    current.update(updates)
+    merged = save_preferences(db, user_id, current)
+    return Preferences(**merged)
 
 @app.get("/api/me/accounts", response_model=list[AccountOut], dependencies=[Depends(ip_allowlist)])
 async def my_accounts(user_id: str = Depends(current_user)):
@@ -1027,6 +1120,21 @@ export function getToken(){ return sessionStorage.getItem('token') || ''; }
 export function setToken(t){ sessionStorage.setItem('token', t); }
 export function logout(){ sessionStorage.removeItem('token'); window.location.replace('/'); }
 
+export const DEFAULT_LABELS = {
+  accounts_label: 'Home',
+  sections_label: 'Sections',
+  items_label: 'Items',
+};
+
+export function getLabels(user){
+  const prefs = user?.preferences || {};
+  return {
+    accounts_label: (prefs.accounts_label || DEFAULT_LABELS.accounts_label).trim() || DEFAULT_LABELS.accounts_label,
+    sections_label: (prefs.sections_label || DEFAULT_LABELS.sections_label).trim() || DEFAULT_LABELS.sections_label,
+    items_label: (prefs.items_label || DEFAULT_LABELS.items_label).trim() || DEFAULT_LABELS.items_label,
+  };
+}
+
 export async function api(path, opts={}){
   const headers = Object.assign({ 'Content-Type':'application/json' }, opts.headers||{});
   const token = getToken();
@@ -1048,6 +1156,7 @@ export async function loadMeOrRedirect(){
 }
 
 export function renderShell(user){
+  const labels = getLabels(user);
   const header = document.getElementById('site-header');
   const footer = document.getElementById('site-footer');
   if(header){
@@ -1102,19 +1211,19 @@ cat > "$WEB_PUBLIC_DIR/accounts.html" <<'HTML'
   <main class="container">
     <div class="account-header">
       <div class="account-header-main">
-        <h1>Your Accounts</h1>
+        <h1 id="accountsHeading">Your Accounts</h1>
       </div>
       <div class="account-header-actions">
         <button id="accountsMenuButton" class="icon-btn" aria-haspopup="true" aria-expanded="false" aria-label="Account actions">⋯</button>
         <div id="accountsMenu" class="dropdown-menu">
-          <button type="button" data-action="add-account">Add account</button>
+          <button type="button" data-action="add-account" id="addAccountBtnLabel">Add account</button>
         </div>
       </div>
     </div>
 
     <section>
       <div id="accountsEmptyState" class="empty-state hidden">
-        <p class="small">You do not belong to any accounts yet.</p>
+        <p class="small" id="accountsEmptyCopy">You do not belong to any accounts yet.</p>
       </div>
       <div id="accountList" class="stacked-list"></div>
     </section>
@@ -1187,6 +1296,33 @@ cat > "$WEB_PUBLIC_DIR/settings.html" <<'HTML'
 </body></html>
 HTML
 
+cat > "$WEB_PUBLIC_DIR/customisation.html" <<'HTML'
+<!doctype html><html><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Customisation</title>
+  <link rel="stylesheet" href="/app.css">
+</head><body>
+  <header id="site-header"></header>
+  <main class="container">
+    <a class="btn" href="/settings.html">← Back to settings</a>
+    <h1>Customisation</h1>
+    <p class="small">Update the labels you see for key parts of the UI. Changes are saved to your user profile.</p>
+    <form id="customisationForm" class="card" style="padding:16px;">
+      <p><label>Accounts label<input type="text" id="accountsLabel" required></label></p>
+      <p><label>Sections label<input type="text" id="sectionsLabel" required></label></p>
+      <p><label>Items label<input type="text" id="itemsLabel" required></label></p>
+      <div class="actions" style="justify-content:flex-start;">
+        <button type="submit" class="btn primary">Save changes</button>
+        <button type="button" class="btn" id="resetDefaults">Reset to defaults</button>
+      </div>
+      <p id="customisationMsg" class="small"></p>
+    </form>
+  </main>
+  <footer id="site-footer"></footer>
+  <script type="module" src="/js/customisation.js"></script>
+</body></html>
+HTML
+
 # Account detail page (sections list + 3-dot menu + modal "Create section")
 cat > "$WEB_PUBLIC_DIR/account.html" <<'HTML'
 <!doctype html><html><head>
@@ -1214,10 +1350,10 @@ cat > "$WEB_PUBLIC_DIR/account.html" <<'HTML'
     </div>
 
     <section>
-      <h2>Sections</h2>
+      <h2 id="sectionsHeading">Sections</h2>
       <div id="sectionList"></div>
       <div id="emptyState" class="empty-state hidden">
-        <p class="small">No sections have been created for this account yet.</p>
+        <p class="small" id="sectionsEmptyCopy">No sections have been created for this account yet.</p>
         <button id="emptyCreateSectionBtn" class="btn">Create a section</button>
       </div>
     </section>
@@ -1228,7 +1364,7 @@ cat > "$WEB_PUBLIC_DIR/account.html" <<'HTML'
         <h2>Create section</h2>
         <form id="sectionForm">
           <p><label>Slug (no spaces)<input type="text" id="sectionSlug" required></label></p>
-          <p><label>Label (display name)<input type="text" id="sectionLabel" required></label></p>
+          <p><label id="sectionLabelPrompt">Label (display name)<input type="text" id="sectionLabel" required></label></p>
           <div class="modal-actions">
             <button type="button" class="btn" id="sectionCancel">Cancel</button>
             <button type="submit" class="btn primary">Save</button>
@@ -1263,20 +1399,20 @@ cat > "$WEB_PUBLIC_DIR/section.html" <<'HTML'
       <div class="account-header-actions">
         <button id="sectionMenuButton" class="icon-btn" aria-haspopup="true" aria-expanded="false" aria-label="Section actions">⋯</button>
         <div id="sectionMenu" class="dropdown-menu">
-          <button type="button" data-action="edit">Edit section</button>
-          <button type="button" data-action="add-item">Add item</button>
-          <button type="button" data-action="delete" class="danger">Delete section</button>
+          <button type="button" data-action="edit" id="editSectionMenuLabel">Edit section</button>
+          <button type="button" data-action="add-item" id="addItemMenuLabel">Add item</button>
+          <button type="button" data-action="delete" class="danger" id="deleteSectionMenuLabel">Delete section</button>
         </div>
       </div>
     </div>
 
     <section class="card">
       <div class="actions" style="margin-top:0;margin-bottom:8px;justify-content:space-between;">
-        <h2 style="margin:0;">Items</h2>
+        <h2 style="margin:0;" id="itemsHeading">Items</h2>
         <button id="addItemButton" class="btn">Add item</button>
       </div>
       <div id="itemsEmptyState" class="empty-state hidden">
-        <p class="small">No items in this section yet.</p>
+        <p class="small" id="itemsEmptyCopy">No items in this section yet.</p>
         <button id="emptyAddItemButton" class="btn">Add your first item</button>
       </div>
       <div id="itemsTableContainer" class="table-wrapper"></div>
@@ -1381,11 +1517,20 @@ JS
 
 # Accounts listing
 cat > "$WEB_JS_DIR/api.js" <<'JS'
-import { loadMeOrRedirect, renderShell, api } from './common.js';
+import { loadMeOrRedirect, renderShell, api, getLabels } from './common.js';
 (async () => {
   const me = await loadMeOrRedirect(); if(!me) return;
   renderShell(me);
-
+  
+  const labels = getLabels(me);
+  const accountHeading = document.getElementById('accountsHeading');
+  const emptyCopy = document.getElementById('accountsEmptyCopy');
+  const addAccountBtnLabel = document.getElementById('addAccountBtnLabel');
+  if(accountHeading){ accountHeading.textContent = labels.accounts_label; }
+  if(emptyCopy){ emptyCopy.textContent = `You do not have any ${labels.accounts_label.toLowerCase()} yet.`; }
+  if(addAccountBtnLabel){ addAccountBtnLabel.textContent = `Add ${labels.accounts_label}`; }
+  document.title = labels.accounts_label;
+  
   const listEl = document.getElementById('accountList');
   const emptyStateEl = document.getElementById('accountsEmptyState');
   const menuButton = document.getElementById('accountsMenuButton');
@@ -1535,6 +1680,7 @@ import { loadMeOrRedirect, renderShell } from './common.js';
 
   const list = document.getElementById('settingsList');
   const sections = [
+    { key:'customisation', label:'Customisation', description:'Rename UI labels for accounts, sections, and items for your user.', href:'/customisation.html' },
     { key:'admin', label:'Admin', description:'Manage platform admins and their account access.', href:'/admin.html' },
   ];
 
@@ -1550,9 +1696,63 @@ import { loadMeOrRedirect, renderShell } from './common.js';
 })();
 JS
 
+cat > "$WEB_JS_DIR/customisation.js" <<'JS'
+import { loadMeOrRedirect, renderShell, api, getLabels, DEFAULT_LABELS } from './common.js';
+
+(async () => {
+  const me = await loadMeOrRedirect(); if(!me) return;
+  renderShell(me);
+  if(!me.is_admin){ window.location.replace('/accounts.html'); return; }
+
+  const form = document.getElementById('customisationForm');
+  const msg = document.getElementById('customisationMsg');
+  const accountsInput = document.getElementById('accountsLabel');
+  const sectionsInput = document.getElementById('sectionsLabel');
+  const itemsInput = document.getElementById('itemsLabel');
+  const resetBtn = document.getElementById('resetDefaults');
+
+  const labels = getLabels(me);
+  document.title = 'Customisation';
+  accountsInput.value = labels.accounts_label;
+  sectionsInput.value = labels.sections_label;
+  itemsInput.value = labels.items_label;
+
+  async function save(payload){
+    msg.textContent = 'Saving…';
+    try{
+      const res = await api('/api/me/preferences', { method:'PUT', body: JSON.stringify(payload) });
+      me.preferences = res;
+      renderShell(me);
+      msg.textContent = 'Saved.';
+    }catch(e){
+      msg.textContent = e.message || 'Failed to save preferences';
+    }
+  }
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    await save({
+      accounts_label: accountsInput.value.trim(),
+      sections_label: sectionsInput.value.trim(),
+      items_label: itemsInput.value.trim(),
+    });
+  });
+
+  if(resetBtn){
+    resetBtn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      accountsInput.value = DEFAULT_LABELS.accounts_label;
+      sectionsInput.value = DEFAULT_LABELS.sections_label;
+      itemsInput.value = DEFAULT_LABELS.items_label;
+      await save(DEFAULT_LABELS);
+    });
+  }
+})();
+JS
+
 # Account details logic (sections list + menu + modal)
 cat > "$WEB_JS_DIR/account.js" <<'JS'
-import { loadMeOrRedirect, renderShell, api } from './common.js';
+import { loadMeOrRedirect, renderShell, api, getLabels } from './common.js';
 
 function qs(name){
   const m = new URLSearchParams(location.search).get(name);
@@ -1567,6 +1767,7 @@ function slugify(val){
 (async () => {
   const me = await loadMeOrRedirect(); if(!me) return;
   renderShell(me);
+  const labels = getLabels(me);
 
   const accountId = qs('id');
   if(!accountId){
@@ -1579,6 +1780,19 @@ function slugify(val){
   const emptyStateEl = document.getElementById('emptyState');
   const emptyCreateBtn = document.getElementById('emptyCreateSectionBtn');
 
+  const sectionsHeading = document.getElementById('sectionsHeading');
+  const sectionsEmptyCopy = document.getElementById('sectionsEmptyCopy');
+  const sectionModalTitle = document.getElementById('sectionModalTitle');
+  const sectionLabelPrompt = document.getElementById('sectionLabelPrompt');
+
+  if(sectionsHeading){ sectionsHeading.textContent = labels.sections_label; }
+  if(sectionsEmptyCopy){ sectionsEmptyCopy.textContent = `No ${labels.sections_label.toLowerCase()} have been created for this account yet.`; }
+  if(sectionModalTitle){ sectionModalTitle.textContent = `Create ${labels.sections_label}`; }
+  if(sectionLabelPrompt){ sectionLabelPrompt.firstChild.textContent = `${labels.sections_label} name`;
+    const input = sectionLabelPrompt.querySelector('input');
+    if(input) input.placeholder = `${labels.sections_label} name`;
+  }
+
   const modal = document.getElementById('sectionModal');
   const sectionForm = document.getElementById('sectionForm');
   const sectionMsg = document.getElementById('sectionMsg');
@@ -1588,6 +1802,10 @@ function slugify(val){
 
   const menuButton = document.getElementById('accountMenuButton');
   const menu = document.getElementById('accountMenu');
+  const addSectionMenuBtn = menu ? menu.querySelector('button[data-action="add-section"]') : null;
+
+  if(emptyCreateBtn){ emptyCreateBtn.textContent = `Create a ${labels.sections_label}`; }
+  if(addSectionMenuBtn){ addSectionMenuBtn.textContent = `Add ${labels.sections_label}`; }
 
   let accountName = `Account ${accountId}`;
 
@@ -1603,6 +1821,7 @@ function slugify(val){
   } catch {
     acctNameEl.textContent = `Account ${accountId}`;
   }
+  document.title = `${accountName} | ${labels.sections_label}`;
 
   function openMenu(){
     menu.classList.add('open');
@@ -1753,7 +1972,7 @@ JS
 
 # Section page logic (schema-driven table + modal + menu)
 cat > "$WEB_JS_DIR/section.js" <<'JS'
-import { loadMeOrRedirect, renderShell, api } from './common.js';
+import { loadMeOrRedirect, renderShell, api, getLabels } from './common.js';
 
 function qs(name){
   const m = new URLSearchParams(location.search).get(name);
@@ -1794,6 +2013,7 @@ function parseLooseValue(str){
 (async () => {
   const me = await loadMeOrRedirect(); if(!me) return;
   renderShell(me);
+  const labels = getLabels(me);
 
   const accountId = qs('account');
   const slug = qs('slug');
@@ -1809,9 +2029,15 @@ function parseLooseValue(str){
   const itemsTableContainer = document.getElementById('itemsTableContainer');
   const addItemButton = document.getElementById('addItemButton');
   const emptyAddItemButton = document.getElementById('emptyAddItemButton');
+  const itemsHeading = document.getElementById('itemsHeading');
+  const itemsEmptyCopy = document.getElementById('itemsEmptyCopy');
+  const itemModalTitle = document.getElementById('itemModalTitle');
 
   const menuButton = document.getElementById('sectionMenuButton');
   const menu = document.getElementById('sectionMenu');
+  const editSectionMenuLabel = document.getElementById('editSectionMenuLabel');
+  const addItemMenuLabel = document.getElementById('addItemMenuLabel');
+  const deleteSectionMenuLabel = document.getElementById('deleteSectionMenuLabel');
 
   const itemModal = document.getElementById('itemModal');
   const itemForm = document.getElementById('itemForm');
@@ -1822,6 +2048,15 @@ function parseLooseValue(str){
   const kvEditorContainer = document.getElementById('kvEditorContainer');
   const kvRowsTbody = document.getElementById('kvRows');
   const addKVRowBtn = document.getElementById('addKVRowBtn');
+
+  if(itemsHeading){ itemsHeading.textContent = labels.items_label; }
+  if(addItemButton){ addItemButton.textContent = `Add ${labels.items_label}`; }
+  if(emptyAddItemButton){ emptyAddItemButton.textContent = `Add your first ${labels.items_label.toLowerCase()}`; }
+  if(itemsEmptyCopy){ itemsEmptyCopy.textContent = `No ${labels.items_label.toLowerCase()} in this ${labels.sections_label.toLowerCase()} yet.`; }
+  if(editSectionMenuLabel){ editSectionMenuLabel.textContent = `Edit ${labels.sections_label}`; }
+  if(addItemMenuLabel){ addItemMenuLabel.textContent = `Add ${labels.items_label}`; }
+  if(deleteSectionMenuLabel){ deleteSectionMenuLabel.textContent = `Delete ${labels.sections_label}`; }
+  if(itemModalTitle){ itemModalTitle.textContent = `Add ${labels.items_label}`; }
 
   if(backLink){
     backLink.href = `/account.html?id=${encodeURIComponent(accountId)}`;
@@ -1847,11 +2082,13 @@ function parseLooseValue(str){
       metaEl.textContent = `${accountName} · slug: ${section.slug}`;
       const s = section.schema || {};
       schemaFields = Array.isArray(s.fields) ? s.fields : [];
+      document.title = `${section.label} | ${labels.sections_label}`;
     } catch {
       titleEl.textContent = `Section ${slug}`;
       metaEl.textContent = accountName;
       currentSection = { slug, label: slug, schema: {} };
       schemaFields = [];
+      document.title = `${labels.sections_label} ${slug}`;
     }
   }
 
@@ -2142,7 +2379,7 @@ JS
 
 # Item detail page logic (vertical layout)
 cat > "$WEB_JS_DIR/item.js" <<'JS'
-import { loadMeOrRedirect, renderShell, api } from './common.js';
+import { loadMeOrRedirect, renderShell, api, getLabels } from './common.js';
 
 function qs(name){
   const m = new URLSearchParams(location.search).get(name);
@@ -2171,6 +2408,8 @@ function formatValue(val){
 (async () => {
   const me = await loadMeOrRedirect(); if(!me) return;
   renderShell(me);
+  const labels = getLabels(me);
+  document.title = labels.items_label;
 
   const accountId = qs('account');
   const sectionSlug = qs('section');
@@ -2221,7 +2460,8 @@ function formatValue(val){
     const item = await api(`/api/accounts/${accountId}/items/${encodeURIComponent(itemId)}`);
     itemNameEl.textContent = item.name;
     const sectionLabel = section ? section.label : (sectionSlug || 'No section');
-    itemMetaEl.textContent = `${accountName} · ${sectionLabel} · id: ${itemId}`;
+    itemMetaEl.textContent = `${accountName} · ${labels.sections_label}: ${sectionLabel} · id: ${itemId}`;
+    document.title = `${item.name} | ${labels.items_label}`;
 
     const data = item.data || {};
     const rows = [];
@@ -2253,7 +2493,7 @@ function formatValue(val){
     }
 
     if(!rows.length){
-      itemPropsBody.innerHTML = '<tr><td class="small" colspan="2">No properties for this item.</td></tr>';
+      itemPropsBody.innerHTML = `<tr><td class="small" colspan="2">No properties for this ${labels.items_label.toLowerCase()}.</td></tr>`;
     } else {
       itemPropsBody.innerHTML = rows.map(r => `
         <tr>
@@ -2379,6 +2619,7 @@ Pages:
                                 → schema-driven items table + 3-dot menu + item modal
   /item.html?account=<ACCOUNT_ID>&section=<SLUG>&item=<ITEM_ID>
                                 → item detail (vertical layout)
+  /customisation.html           → per-user label settings (admin)
   /settings.html                → settings hub (admin)
   /admin.html                   → list admin users + "Add Admin"
   /admin-add.html               → create admin, choose accounts
@@ -2386,6 +2627,8 @@ Pages:
 API (extended):
   POST /api/login
   GET  /api/me
+  GET  /api/me/preferences
+  PUT  /api/me/preferences
   GET  /api/me/accounts
 
   # Accounts
