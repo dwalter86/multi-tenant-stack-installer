@@ -1196,7 +1196,6 @@ cat > "$WEB_PUBLIC_DIR/index.html" <<'HTML'
     </form>
     <div id="msg" class="small"></div>
   </main>
-  <footer id="site-footer"></footer>
   <script type="module" src="/js/auth.js"></script>
 </body></html>
 HTML
@@ -1228,7 +1227,6 @@ cat > "$WEB_PUBLIC_DIR/accounts.html" <<'HTML'
       <div id="accountList" class="stacked-list"></div>
     </section>
   </main>
-  <footer id="site-footer"></footer>
   <script type="module" src="/js/api.js"></script>
 </body></html>
 HTML
@@ -1248,7 +1246,6 @@ cat > "$WEB_PUBLIC_DIR/admin.html" <<'HTML'
       <tbody id="adminRows"><tr><td colspan="2">Loading…</td></tr></tbody>
     </table>
   </main>
-  <footer id="site-footer"></footer>
   <script type="module" src="/js/admin.js"></script>
 </body></html>
 HTML
@@ -1274,7 +1271,6 @@ cat > "$WEB_PUBLIC_DIR/admin-add.html" <<'HTML'
     <p id="msg" class="small"></p>
     <p><a class="btn" href="/admin.html">Back to Admins</a></p>
   </main>
-  <footer id="site-footer"></footer>
   <script type="module" src="/js/admin_add.js"></script>
 </body></html>
 HTML
@@ -1291,7 +1287,6 @@ cat > "$WEB_PUBLIC_DIR/settings.html" <<'HTML'
     <p class="small">Choose a settings area to manage.</p>
     <div id="settingsList" class="stacked-list"></div>
   </main>
-  <footer id="site-footer"></footer>
   <script type="module" src="/js/settings.js"></script>
 </body></html>
 HTML
@@ -1318,7 +1313,6 @@ cat > "$WEB_PUBLIC_DIR/customisation.html" <<'HTML'
       <p id="customisationMsg" class="small"></p>
     </form>
   </main>
-  <footer id="site-footer"></footer>
   <script type="module" src="/js/customisation.js"></script>
 </body></html>
 HTML
@@ -1374,7 +1368,6 @@ cat > "$WEB_PUBLIC_DIR/account.html" <<'HTML'
       </div>
     </div>
   </main>
-  <footer id="site-footer"></footer>
   <script type="module" src="/js/account.js"></script>
 </body></html>
 HTML
@@ -1449,7 +1442,6 @@ cat > "$WEB_PUBLIC_DIR/section.html" <<'HTML'
       </div>
     </div>
   </main>
-  <footer id="site-footer"></footer>
   <script type="module" src="/js/section.js"></script>
 </body></html>
 HTML
@@ -1489,7 +1481,6 @@ cat > "$WEB_PUBLIC_DIR/item.html" <<'HTML'
       </details>
     </section>
   </main>
-  <footer id="site-footer"></footer>
   <script type="module" src="/js/item.js"></script>
 </body></html>
 HTML
