@@ -2206,6 +2206,15 @@ function escapeHtml(str){
     .replace(/>/g,'&gt;');
 }
 
+function formatDateTime(val){
+  if(!val) return '';
+  try {
+    return new Date(val).toLocaleString();
+  } catch {
+    return escapeHtml(String(val));
+  }
+}
+
 function formatCellValue(val){
   if(val === null || val === undefined) return '';
   if(typeof val === 'object'){
