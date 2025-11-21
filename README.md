@@ -36,6 +36,8 @@ systemctl restart stack
 The installer writes everything under `/opt/stack` (owned by the invoking user) and drops a systemd unit for lifecycle management. After the script completes, the key files live at:
 
 ```
+
+```
 /opt/stack
 ├── .env                          # Generated if missing; holds DB creds, JWT secret, ports
 ├── docker-compose.yml            # Orchestrates db, adminer, api, web, caddy services
