@@ -1466,7 +1466,6 @@ cat > "$WEB_PUBLIC_DIR/item.html" <<'HTML'
     </div>
 
     <section class="card">
-      <h2 style="margin-top:0;">Properties</h2>
       <div class="table-wrapper">
         <table class="properties-table">
           <tbody id="itemProperties"></tbody>
